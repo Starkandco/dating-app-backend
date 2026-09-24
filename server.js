@@ -650,8 +650,13 @@ function getPublishFiles(body) {
   return { files }
 }
 
-
-async function publishFiles(token, owner, repo, body) {
+async function publishFiles(
+  token,
+  owner,
+  repo,
+  body,
+  { createIfMissing = false } = {}
+) {
   const filesResult = getPublishFiles(body)
 
   if (filesResult.error) {
@@ -660,14 +665,34 @@ async function publishFiles(token, owner, repo, body) {
     throw error
   }
 
-  const repository = await githubRequest(
-    repositoryUrl(owner, repo),
-    {
-      headers: {
-        Authorization: `Bearer ${token}`
+  let repository
+
+  try {
+    repository = await githubRequest(
+      repositoryUrl(owner, repo),
+      {
+        headers: {
+          Authorization: `Bearer ${token}`
+        }
       }
+    )
+  } catch (error) {
+    if (error.status !== 404 || !createIfMissing) {
+      throw error
     }
-  )
+
+    repository = await githubJsonRequest(
+      token,
+      `${githubApiUrl}/user/repos`,
+      "POST",
+      {
+        name: repo,
+        private: false,
+        auto_init: true,
+        description: "Published site"
+      }
+    )
+  }
   const branch = body.branch || repository.data.default_branch || "main"
 
   if (
@@ -1376,7 +1401,11 @@ app.post("/github/repositories/:owner/:repo/publish", requireSession, async (req
       decryptToken(res.locals.user),
       repository.owner,
       repository.repo,
-      req.body || {}
+      req.body || {},
+      {
+        createIfMissing: repository.owner.toLowerCase() ===
+          res.locals.user.github_login.toLowerCase()
+      }
     )
 
     return res.json(result)
@@ -1408,7 +1437,11 @@ app.post("/github/publish", requireSession, async (req, res) => {
       decryptToken(res.locals.user),
       owner,
       repo,
-      body
+      body,
+      {
+        createIfMissing: owner.toLowerCase() ===
+          res.locals.user.github_login.toLowerCase()
+      }
     )
 
     return res.json(result)
