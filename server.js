@@ -510,6 +510,7 @@ async function githubRequest(
     error.status = response.status
     error.data = data
     error.headers = response.headers
+    error.url = url
 
     throw error
   }
@@ -567,6 +568,11 @@ function sendGitHubError(res, error) {
   const status = Number.isInteger(error.status)
     ? error.status
     : 502
+
+  console.error(
+    `GITHUB REQUEST FAILED: ${status} ${error.url || "unknown URL"} - ` +
+    error.message
+  )
 
   return res.status(status).json({
     error: status >= 500
