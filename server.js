@@ -1265,6 +1265,38 @@ app.get("/auth-status", requireSession, (req, res) => {
 })
 
 
+app.get("/github/installation-status", requireSession, async (req, res) => {
+  const appSlug = process.env.GITHUB_APP_SLUG
+
+  if (!appSlug) {
+    return res.status(500).json({
+      error: "GITHUB_APP_SLUG is not configured"
+    })
+  }
+
+  try {
+    const result = await githubRequest(
+      `${githubApiUrl}/user/installations?per_page=100`,
+      {
+        headers: {
+          Authorization: `Bearer ${decryptToken(res.locals.user)}`
+        }
+      }
+    )
+
+    const installed = result.data.installations?.some(
+      (installation) => installation.app_slug === appSlug
+    ) || false
+
+    return res.json({
+      installed
+    })
+  } catch (error) {
+    return sendGitHubError(res, error)
+  }
+})
+
+
 app.get("/github/user", requireSession, async (req, res) => {
   try {
     const token = decryptToken(res.locals.user)

@@ -48,10 +48,15 @@ endpoint is public; authenticated endpoints are:
 
 ```sh
 GET /auth-status
+GET /github/installation-status
 GET /github/user
 POST /logout
 GET /auth/desktop/status?transaction=...
 ```
+
+`GET /github/installation-status` requires authentication and returns
+`{"installed":true}` when the signed-in user has installed the configured
+GitHub App. It returns `{"installed":false}` otherwise.
 
 Desktop clients start OAuth by requesting `GET /auth/github` with a PKCE
 `code_challenge`. The response is:
