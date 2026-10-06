@@ -14,6 +14,8 @@ const databaseUrl = process.env.DATABASE_URL
 const tokenEncryptionKey = process.env.TOKEN_ENCRYPTION_KEY
 
 const githubCallbackUrl = process.env.GITHUB_CALLBACK_URL
+let githubAppInstallationTokenCache = null
+let githubAppInstallationTokenRequest = null
 const oauthStateCookieName = "github_oauth_state"
 const sessionCookieName = isProduction
   ? "__Host-app_session"
@@ -292,6 +294,7 @@ async function requireSession(req, res, next) {
 
     const result = await pool.query(
           `SELECT u.id, u.github_login, u.google_id, u.email, u.name,
+              u.repository_name,
               u.token_ciphertext, u.token_iv, u.token_auth_tag
          FROM sessions s
          JOIN users u ON u.id = s.user_id
@@ -320,10 +323,149 @@ async function requireSession(req, res, next) {
 }
 
 
-function requireGitHubSession(req, res, next) {
-  if (!res.locals.user.token_ciphertext) {
+function getGitHubAppConfiguration() {
+  const appId = process.env.GITHUB_APP_ID
+  const installationId = process.env.GITHUB_APP_INSTALLATION_ID
+  const privateKeyBase64 = process.env.GITHUB_APP_PRIVATE_KEY_BASE64
+  const repositoryOwner = process.env.GITHUB_REPOSITORY_OWNER
+  const missingConfiguration = [
+    ["GITHUB_APP_ID", appId],
+    ["GITHUB_APP_INSTALLATION_ID", installationId],
+    ["GITHUB_APP_PRIVATE_KEY_BASE64", privateKeyBase64],
+    ["GITHUB_REPOSITORY_OWNER", repositoryOwner]
+  ]
+    .filter(([, value]) => !value)
+    .map(([name]) => name)
+
+  if (missingConfiguration.length > 0) {
+    const error = new Error("Missing GitHub App configuration")
+    error.status = 500
+    error.missing = missingConfiguration
+    throw error
+  }
+
+  return {
+    appId,
+    installationId,
+    privateKey: Buffer.from(privateKeyBase64, "base64").toString("utf8"),
+    repositoryOwner
+  }
+}
+
+
+async function getGitHubAppInstallationToken(config = getGitHubAppConfiguration()) {
+  const now = Date.now()
+
+  if (
+    githubAppInstallationTokenCache &&
+    githubAppInstallationTokenCache.expiresAt > now + 60_000
+  ) {
+    return githubAppInstallationTokenCache.token
+  }
+
+  if (githubAppInstallationTokenRequest) {
+    return githubAppInstallationTokenRequest
+  }
+
+  githubAppInstallationTokenRequest = (async () => {
+    const privateKey = config.privateKey
+
+    if (!privateKey.includes("PRIVATE KEY-----")) {
+      const error = new Error("GITHUB_APP_PRIVATE_KEY_BASE64 is not a PEM private key")
+      error.status = 500
+      throw error
+    }
+
+    const issuedAt = Math.floor(now / 1000) - 60
+    const appJwt = jwt.sign(
+      {
+        iat: issuedAt,
+        exp: issuedAt + 9 * 60,
+        iss: config.appId
+      },
+      privateKey,
+      { algorithm: "RS256" }
+    )
+    const tokenResult = await githubJsonRequest(
+      appJwt,
+      `${githubApiUrl}/app/installations/${encodeURIComponent(config.installationId)}/access_tokens`,
+      "POST",
+      {}
+    )
+    const expiresAt = new Date(tokenResult.data.expires_at).getTime()
+
+    if (!tokenResult.data.token || !Number.isFinite(expiresAt)) {
+      const error = new Error("GitHub did not return a valid installation token")
+      error.status = 502
+      throw error
+    }
+
+    githubAppInstallationTokenCache = {
+      token: tokenResult.data.token,
+      expiresAt
+    }
+
+    return tokenResult.data.token
+  })()
+
+  try {
+    return await githubAppInstallationTokenRequest
+  } finally {
+    githubAppInstallationTokenRequest = null
+  }
+}
+
+
+async function requireGitHubSession(req, res, next) {
+  try {
+    if (res.locals.user.google_id) {
+      const config = getGitHubAppConfiguration()
+      res.locals.githubToken = await getGitHubAppInstallationToken(config)
+      res.locals.repositoryOwner = config.repositoryOwner
+      res.locals.repositoryName = res.locals.user.repository_name
+    } else if (res.locals.user.token_ciphertext) {
+      res.locals.githubToken = decryptToken(res.locals.user)
+    } else {
+      return res.status(403).json({
+        error: "A GitHub account is required for this operation"
+      })
+    }
+
+    return next()
+  } catch (error) {
+    console.error("GITHUB AUTHORIZATION FAILED:", error.message)
+
+    return res.status(error.status || 502).json({
+      error: error.status === 500
+        ? error.message
+        : "GitHub authorization unavailable",
+      ...(error.missing ? { missing: error.missing } : {})
+    })
+  }
+}
+
+
+function authorizeGoogleRepository(req, res, next) {
+  const user = res.locals.user
+
+  if (!user.google_id) {
+    return next()
+  }
+
+  const bodyRepository = req.body?.repository || {}
+  const owner = req.params.owner || req.body?.owner || bodyRepository.owner ||
+    res.locals.repositoryOwner
+  const repo = req.params.repo || req.body?.repo || bodyRepository.name ||
+    req.body?.name || res.locals.repositoryName
+
+  if (
+    typeof owner !== "string" ||
+    owner.toLowerCase() !== res.locals.repositoryOwner.toLowerCase() ||
+    typeof repo !== "string" ||
+    repo.toLowerCase() !== res.locals.repositoryName?.toLowerCase()
+  ) {
     return res.status(403).json({
-      error: "A GitHub account is required for this operation"
+      error: "Google accounts can only access their assigned repository"
     })
   }
 
@@ -893,7 +1035,7 @@ async function publishFiles(
   owner,
   repo,
   body,
-  { createIfMissing = false } = {}
+  { createIfMissing = false, repositoryCreationUrl = null } = {}
 ) {
   const filesResult = getPublishFiles(body)
 
@@ -921,7 +1063,7 @@ async function publishFiles(
 
     repository = await githubJsonRequest(
       token,
-      `${githubApiUrl}/user/repos`,
+      repositoryCreationUrl || `${githubApiUrl}/user/repos`,
       "POST",
       {
         name: repo,
@@ -1649,6 +1791,12 @@ app.get("/auth-status", requireSession, (req, res) => {
 
 
 app.get("/github/installation-status", requireSession, requireGitHubSession, async (req, res) => {
+  if (res.locals.user.google_id) {
+    return res.json({
+      installed: true
+    })
+  }
+
   const appSlug = process.env.GITHUB_APP_SLUG
 
   if (!appSlug) {
@@ -1662,7 +1810,7 @@ app.get("/github/installation-status", requireSession, requireGitHubSession, asy
       `${githubApiUrl}/user/installations?per_page=100`,
       {
         headers: {
-          Authorization: `Bearer ${decryptToken(res.locals.user)}`
+          Authorization: `Bearer ${res.locals.githubToken}`
         }
       }
     )
@@ -1681,8 +1829,16 @@ app.get("/github/installation-status", requireSession, requireGitHubSession, asy
 
 
 app.get("/github/user", requireSession, requireGitHubSession, async (req, res) => {
+  if (res.locals.user.google_id) {
+    return res.json({
+      login: res.locals.repositoryOwner,
+      name: res.locals.repositoryOwner,
+      repository_name: res.locals.repositoryName
+    })
+  }
+
   try {
-    const token = decryptToken(res.locals.user)
+    const token = res.locals.githubToken
     const userResult = await githubRequest(
       `${githubApiUrl}/user`,
       {
@@ -1708,7 +1864,7 @@ app.get("/github/user", requireSession, requireGitHubSession, async (req, res) =
 })
 
 
-app.post("/github/repositories", requireSession, requireGitHubSession, async (req, res) => {
+app.post("/github/repositories", requireSession, requireGitHubSession, authorizeGoogleRepository, async (req, res) => {
   try {
     const body = req.body || {}
     const name = body.name
@@ -1722,9 +1878,13 @@ app.post("/github/repositories", requireSession, requireGitHubSession, async (re
       })
     }
 
+    const isGoogleUser = Boolean(res.locals.user.google_id)
+    const createRepositoryUrl = isGoogleUser
+      ? `${githubApiUrl}/orgs/${encodeURIComponent(res.locals.repositoryOwner)}/repos`
+      : `${githubApiUrl}/user/repos`
     const result = await githubJsonRequest(
-      decryptToken(res.locals.user),
-      `${githubApiUrl}/user/repos`,
+      res.locals.githubToken,
+      createRepositoryUrl,
       "POST",
       {
         name,
@@ -1749,7 +1909,7 @@ app.post("/github/repositories", requireSession, requireGitHubSession, async (re
 })
 
 
-app.get("/github/repositories/:owner/:repo", requireSession, requireGitHubSession, async (req, res) => {
+app.get("/github/repositories/:owner/:repo", requireSession, requireGitHubSession, authorizeGoogleRepository, async (req, res) => {
   const repository = repositoryParams(req)
 
   if (!repository) {
@@ -1763,7 +1923,7 @@ app.get("/github/repositories/:owner/:repo", requireSession, requireGitHubSessio
       repositoryUrl(repository.owner, repository.repo),
       {
         headers: {
-          Authorization: `Bearer ${decryptToken(res.locals.user)}`
+          Authorization: `Bearer ${res.locals.githubToken}`
         }
       }
     )
@@ -1775,7 +1935,7 @@ app.get("/github/repositories/:owner/:repo", requireSession, requireGitHubSessio
 })
 
 
-app.delete("/github/repositories/:owner/:repo", requireSession, requireGitHubSession, async (req, res) => {
+app.delete("/github/repositories/:owner/:repo", requireSession, requireGitHubSession, authorizeGoogleRepository, async (req, res) => {
   const repository = repositoryParams(req)
 
   if (!repository) {
@@ -1790,7 +1950,7 @@ app.delete("/github/repositories/:owner/:repo", requireSession, requireGitHubSes
       {
         method: "DELETE",
         headers: {
-          Authorization: `Bearer ${decryptToken(res.locals.user)}`
+          Authorization: `Bearer ${res.locals.githubToken}`
         }
       }
     )
@@ -1802,7 +1962,7 @@ app.delete("/github/repositories/:owner/:repo", requireSession, requireGitHubSes
 })
 
 
-app.post("/github/repositories/:owner/:repo/publish", requireSession, requireGitHubSession, async (req, res) => {
+app.post("/github/repositories/:owner/:repo/publish", requireSession, requireGitHubSession, authorizeGoogleRepository, async (req, res) => {
   const repository = repositoryParams(req)
 
   if (!repository) {
@@ -1813,13 +1973,17 @@ app.post("/github/repositories/:owner/:repo/publish", requireSession, requireGit
 
   try {
     const result = await publishFiles(
-      decryptToken(res.locals.user),
+      res.locals.githubToken,
       repository.owner,
       repository.repo,
       req.body || {},
       {
-        createIfMissing: repository.owner.toLowerCase() ===
-          res.locals.user.github_login.toLowerCase()
+        createIfMissing: res.locals.user.google_id ||
+          repository.owner.toLowerCase() ===
+            res.locals.user.github_login.toLowerCase(),
+        repositoryCreationUrl: res.locals.user.google_id
+          ? `${githubApiUrl}/orgs/${encodeURIComponent(repository.owner)}/repos`
+          : null
       }
     )
 
@@ -1830,11 +1994,13 @@ app.post("/github/repositories/:owner/:repo/publish", requireSession, requireGit
 })
 
 
-app.post("/github/publish", requireSession, requireGitHubSession, async (req, res) => {
+app.post("/github/publish", requireSession, requireGitHubSession, authorizeGoogleRepository, async (req, res) => {
   const body = req.body || {}
   const repository = body.repository || {}
-  const owner = body.owner || repository.owner
-  const repo = body.repo || repository.name
+  const owner = body.owner || repository.owner ||
+    (res.locals.user.google_id ? res.locals.repositoryOwner : undefined)
+  const repo = body.repo || repository.name ||
+    (res.locals.user.google_id ? res.locals.repositoryName : undefined)
 
   if (
     typeof owner !== "string" ||
@@ -1849,13 +2015,16 @@ app.post("/github/publish", requireSession, requireGitHubSession, async (req, re
 
   try {
     const result = await publishFiles(
-      decryptToken(res.locals.user),
+      res.locals.githubToken,
       owner,
       repo,
       body,
       {
-        createIfMissing: owner.toLowerCase() ===
-          res.locals.user.github_login.toLowerCase()
+        createIfMissing: res.locals.user.google_id ||
+          owner.toLowerCase() === res.locals.user.github_login.toLowerCase(),
+        repositoryCreationUrl: res.locals.user.google_id
+          ? `${githubApiUrl}/orgs/${encodeURIComponent(owner)}/repos`
+          : null
       }
     )
 
@@ -1866,7 +2035,7 @@ app.post("/github/publish", requireSession, requireGitHubSession, async (req, re
 })
 
 
-app.post("/github/repositories/:owner/:repo/pages", requireSession, requireGitHubSession, async (req, res) => {
+app.post("/github/repositories/:owner/:repo/pages", requireSession, requireGitHubSession, authorizeGoogleRepository, async (req, res) => {
   const repository = repositoryParams(req)
 
   if (!repository) {
@@ -1878,7 +2047,7 @@ app.post("/github/repositories/:owner/:repo/pages", requireSession, requireGitHu
   try {
     const body = req.body || {}
     const result = await githubJsonRequest(
-      decryptToken(res.locals.user),
+      res.locals.githubToken,
       repositoryUrl(repository.owner, repository.repo, "/pages"),
       "POST",
       {
@@ -1896,7 +2065,7 @@ app.post("/github/repositories/:owner/:repo/pages", requireSession, requireGitHu
 })
 
 
-app.post("/github/repositories/:owner/:repo/pages/build", requireSession, requireGitHubSession, async (req, res) => {
+app.post("/github/repositories/:owner/:repo/pages/build", requireSession, requireGitHubSession, authorizeGoogleRepository, async (req, res) => {
   const repository = repositoryParams(req)
 
   if (!repository) {
@@ -1907,7 +2076,7 @@ app.post("/github/repositories/:owner/:repo/pages/build", requireSession, requir
 
   try {
     const result = await githubJsonRequest(
-      decryptToken(res.locals.user),
+      res.locals.githubToken,
       repositoryUrl(repository.owner, repository.repo, "/pages/builds"),
       "POST"
     )
@@ -1919,7 +2088,7 @@ app.post("/github/repositories/:owner/:repo/pages/build", requireSession, requir
 })
 
 
-app.get("/github/repositories/:owner/:repo/pages/build", requireSession, requireGitHubSession, async (req, res) => {
+app.get("/github/repositories/:owner/:repo/pages/build", requireSession, requireGitHubSession, authorizeGoogleRepository, async (req, res) => {
   const repository = repositoryParams(req)
 
   if (!repository) {
@@ -1933,7 +2102,7 @@ app.get("/github/repositories/:owner/:repo/pages/build", requireSession, require
       repositoryUrl(repository.owner, repository.repo, "/pages/builds/latest"),
       {
         headers: {
-          Authorization: `Bearer ${decryptToken(res.locals.user)}`
+          Authorization: `Bearer ${res.locals.githubToken}`
         }
       }
     )

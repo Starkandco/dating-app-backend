@@ -10,6 +10,9 @@ GITHUB_CLIENT_ID="your-github-app-client-id"
 GITHUB_CLIENT_SECRET="your-github-client-secret"
 GITHUB_OAUTH_STATE_SECRET="a-long-random-secret"
 GITHUB_APP_SLUG="your-github-app-slug"
+GITHUB_APP_ID="your-github-app-id"
+GITHUB_APP_INSTALLATION_ID="your-organization-installation-id"
+GITHUB_APP_PRIVATE_KEY_BASE64="base64-encoded-github-app-private-key.pem"
 GITHUB_REPOSITORY_OWNER="your-github-account"
 GITHUB_CALLBACK_URL="https://miniature-acorn-97rx7qw5p5g2x7g-3000.app.github.dev/github/callback"
 GOOGLE_CLIENT_ID="your-google-oauth-client-id"
@@ -34,9 +37,19 @@ require a client-supplied PKCE verifier. Google users receive backend sessions
 with a persistent unique `repository_name` derived from their email and Google
 identity. Set `GITHUB_REPOSITORY_OWNER` to the GitHub account that owns those
 repositories; the exchange response includes it and an `is_new_user` flag.
-Google users still need GitHub credentials for the existing repository
-operations. GitHub sign-in remains available independently at `/github/login`
-and continues to require PKCE for desktop clients.
+For Google users, the backend uses the installed GitHub App to create and
+publish only to that user's assigned repository in the configured organization.
+GitHub sign-in remains available independently at `/github/login` and continues
+to use each GitHub user's own OAuth token.
+
+Install the GitHub App on the organization and grant repository Contents
+read/write and Pages read/write permissions. Grant Administration write
+permissions needed to create and manage repositories in the organization.
+Generate a private key in the app settings. Set `GITHUB_APP_ID`,
+`GITHUB_APP_INSTALLATION_ID`, and `GITHUB_APP_PRIVATE_KEY_BASE64` in Render.
+Encode the downloaded PEM key for the last variable with
+`base64 -w0 private-key.pem`; installation tokens are generated and cached by
+the backend and are not stored in the database.
 
 Deploy this repository on Render as a Web Service with:
 
