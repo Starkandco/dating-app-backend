@@ -31,6 +31,7 @@ const pool = new Pool({
 })
 
 const githubApiUrl = "https://api.github.com"
+const githubUserRepositoryName = "date-me"
 
 const githubHeaders = {
   Accept: "application/vnd.github+json",
@@ -656,7 +657,8 @@ async function saveGitHubUser(token) {
 
   return {
     id: savedUserResult.rows[0].id,
-    login
+    login,
+    repository_name: githubUserRepositoryName
   }
 }
 
@@ -1860,7 +1862,10 @@ app.post(["/auth/desktop/exchange", "/auth/google/exchange"], async (req, res) =
           repository_owner: process.env.GITHUB_REPOSITORY_OWNER || null,
           is_new_user: user.is_new_user
         }
-        : {})
+        : {
+          repository_name: user.repository_name,
+          repository_owner: user.login
+        })
     })
   } catch (error) {
     await client.query("ROLLBACK").catch(() => {})
@@ -1948,7 +1953,9 @@ app.get("/github/user", requireSession, requireGitHubSession, async (req, res) =
       id: userResult.data.id,
       login: userResult.data.login,
       name: userResult.data.name || null,
-      avatar_url: userResult.data.avatar_url || null
+      avatar_url: userResult.data.avatar_url || null,
+      repository_owner: userResult.data.login,
+      repository_name: githubUserRepositoryName
     })
   } catch (error) {
     console.error("GITHUB USER REQUEST FAILED:", error.message)

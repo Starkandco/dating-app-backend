@@ -48,7 +48,9 @@ names or visibility. Generate a private key in the GitHub App settings.
 GitHub users sign in separately through the OAuth app at `GET /github/login`.
 Desktop clients start at `GET /auth/github` with a PKCE `code_challenge`, then
 poll the desktop status endpoint and exchange the transaction plus the original
-`code_verifier` at `POST /auth/desktop/exchange`.
+`code_verifier` at `POST /auth/desktop/exchange`. The exchange response
+includes `repository_owner` (the GitHub login) and `repository_name` (`date-me`)
+at the top level, as does `GET /github/user`.
 
 ## Configuration
 
