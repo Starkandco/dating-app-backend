@@ -1051,14 +1051,6 @@ app.get("/auth/google/init", async (req, res) => {
     return
   }
 
-  const codeChallenge = String(req.query.code_challenge || "")
-
-  if (!/^[A-Za-z0-9_-]{43}$/.test(codeChallenge)) {
-    return res.status(400).json({
-      error: "A valid PKCE code_challenge is required"
-    })
-  }
-
   const transactionToken = crypto.randomBytes(32).toString("base64url")
   const state = crypto.randomBytes(32).toString("hex")
   const expiresAt = new Date(
