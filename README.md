@@ -1,12 +1,12 @@
 # Dating App Backend
 
-This Express service handles sign-in, creates private source repositories, and
+This Express service handles sign-in, creates public source repositories, and
 publishes websites with GitHub Pages. Clients receive an app session, not a
 GitHub access token; GitHub API requests stay on the server.
 
 ## Sign-in and publishing
 
-Users can sign in with Google or GitHub. Google accounts get a private
+Users can sign in with Google or GitHub. Google accounts get a public
 repository in the configured organization. The backend names it from the
 email address, adding a short numeric suffix only when that name is already in
 use. Each Google account is restricted to its assigned repository. Existing
@@ -14,17 +14,14 @@ accounts created with the earlier hash-suffixed name are migrated on their next
 Google sign-in.
 
 GitHub sign-in continues to use the user's own GitHub OAuth token. Repositories
-created for Google users in the organization are public so GitHub Pages works
-on the organization's free plan. Repositories created for GitHub OAuth users
-are private; when they publish to an existing repository they own, the backend
-also makes that repository private. It does not change the visibility of
-repositories owned by someone else.
+created through either sign-in method are public so GitHub Pages works on the
+organization's free plan. When a GitHub-authenticated user publishes to an
+existing repository they own, the backend makes that repository public too.
+It does not change the visibility of repositories owned by someone else.
 
 GitHub Pages serves the published website separately from its source
-repository. Pages settings remain public. GitHub requires an eligible plan to
-publish Pages from a private repository, so GitHub OAuth users may need an
-upgraded plan for Pages to work with their private repos. Google users' public
-source repositories can use Pages on the free plan.
+repository. Pages settings remain public, and public source repositories can
+use Pages on the organization's free plan.
 
 ## Google sign-in
 

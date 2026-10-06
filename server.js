@@ -1987,7 +1987,7 @@ app.post("/github/repositories", requireSession, requireGitHubSession, authorize
         description: typeof body.description === "string"
           ? body.description.slice(0, 350)
           : undefined,
-        private: !isGoogleUser,
+        private: false,
         auto_init: true
       }
     )
@@ -2080,7 +2080,7 @@ app.post("/github/repositories/:owner/:repo/publish", requireSession, requireGit
         repositoryCreationUrl: res.locals.user.google_id
           ? `${githubApiUrl}/orgs/${encodeURIComponent(repository.owner)}/repos`
           : null,
-        repositoryPrivate: !res.locals.user.google_id
+        repositoryPrivate: false
       }
     )
 
@@ -2122,7 +2122,7 @@ app.post("/github/publish", requireSession, requireGitHubSession, authorizeGoogl
         repositoryCreationUrl: res.locals.user.google_id
           ? `${githubApiUrl}/orgs/${encodeURIComponent(owner)}/repos`
           : null,
-        repositoryPrivate: !res.locals.user.google_id
+        repositoryPrivate: false
       }
     )
 
