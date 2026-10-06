@@ -26,11 +26,13 @@ user token.
 Use `/github/install` to redirect users to the GitHub App installation page.
 
 Configure a Google OAuth client with `GOOGLE_CALLBACK_URL` as an authorized
-redirect URI. Google sign-in starts at `/auth/google/init` with a PKCE
-`code_challenge`; desktop clients poll `/auth/desktop/status` and exchange
-the transaction at `/auth/google/exchange`. Google users receive backend
-sessions but need a GitHub account for repository operations. GitHub sign-in
-remains available independently at `/github/login`.
+redirect URI. Google sign-in starts at `/auth/google/init`; after browser
+authorization, poll `/auth/desktop/status` and exchange the transaction at
+`/auth/google/exchange`. Google uses the server-side client secret and does not
+require a client-supplied PKCE verifier. Google users receive backend sessions
+but need a GitHub account for repository operations. GitHub sign-in remains
+available independently at `/github/login` and continues to require PKCE for
+desktop clients.
 
 Deploy this repository on Render as a Web Service with:
 
@@ -62,7 +64,7 @@ GET /github/installation-status
 GET /github/user
 POST /logout
 GET /auth/desktop/status?transaction=...
-GET /auth/google/init?code_challenge=...
+GET /auth/google/init
 POST /auth/google/exchange
 ```
 

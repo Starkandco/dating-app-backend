@@ -374,7 +374,7 @@ async function initializeDatabase() {
       transaction_hash TEXT PRIMARY KEY,
       state TEXT UNIQUE NOT NULL,
       provider TEXT NOT NULL DEFAULT 'github',
-      code_challenge TEXT NOT NULL,
+      code_challenge TEXT,
       authorization_code_ciphertext TEXT,
       authorization_code_iv TEXT,
       authorization_code_auth_tag TEXT,
@@ -387,6 +387,10 @@ async function initializeDatabase() {
 
   await pool.query(
     "ALTER TABLE oauth_transactions ADD COLUMN IF NOT EXISTS provider TEXT NOT NULL DEFAULT 'github'"
+  )
+
+  await pool.query(
+    "ALTER TABLE oauth_transactions ALTER COLUMN code_challenge DROP NOT NULL"
   )
 
   await pool.query(
@@ -509,7 +513,7 @@ async function saveGitHubUser(token) {
 }
 
 
-async function exchangeGoogleCode(config, code, codeVerifier) {
+async function exchangeGoogleCode(config, code) {
   const tokenResponse = await fetch(
     "https://oauth2.googleapis.com/token",
     {
@@ -523,8 +527,7 @@ async function exchangeGoogleCode(config, code, codeVerifier) {
         client_id: config.clientId,
         client_secret: config.clientSecret,
         redirect_uri: config.callbackUrl,
-        grant_type: "authorization_code",
-        code_verifier: codeVerifier
+        grant_type: "authorization_code"
       })
     }
   )
@@ -1006,14 +1009,6 @@ app.get("/auth/github", async (req, res) => {
     return
   }
 
-  const codeChallenge = String(req.query.code_challenge || "")
-
-  if (!/^[A-Za-z0-9_-]{43}$/.test(codeChallenge)) {
-    return res.status(400).json({
-      error: "A valid PKCE code_challenge is required"
-    })
-  }
-
   const transactionToken = crypto.randomBytes(32).toString("base64url")
   const state = crypto.randomBytes(32).toString("hex")
   const expiresAt = new Date(
@@ -1075,10 +1070,9 @@ app.get("/auth/google/init", async (req, res) => {
        transaction_hash,
        state,
        provider,
-       code_challenge,
        expires_at
-     ) VALUES ($1, $2, 'google', $3, $4)`,
-    [hashValue(transactionToken), state, codeChallenge, expiresAt]
+     ) VALUES ($1, $2, 'google', $3)`,
+    [hashValue(transactionToken), state, expiresAt]
   )
 
   const authorizeUrl = new URL(
@@ -1089,8 +1083,6 @@ app.get("/auth/google/init", async (req, res) => {
   authorizeUrl.searchParams.set("response_type", "code")
   authorizeUrl.searchParams.set("scope", "openid email profile")
   authorizeUrl.searchParams.set("state", state)
-  authorizeUrl.searchParams.set("code_challenge", codeChallenge)
-  authorizeUrl.searchParams.set("code_challenge_method", "S256")
 
   return res.json({
     authorization_url: authorizeUrl.toString(),
@@ -1135,7 +1127,9 @@ app.get("/auth/desktop/status", async (req, res) => {
   return res.json({
     authorized: Boolean(transaction.authorization_code_ciphertext),
     provider: transaction.provider,
-    exchange_url: "/auth/desktop/exchange",
+    exchange_url: transaction.provider === "google"
+      ? "/auth/google/exchange"
+      : "/auth/desktop/exchange",
     expires_at: new Date(transaction.expires_at).toISOString()
   })
 })
@@ -1407,19 +1401,12 @@ app.post(["/auth/desktop/exchange", "/auth/google/exchange"], async (req, res) =
   const transactionToken = String(req.body?.transaction || "")
   const codeVerifier = String(req.body?.code_verifier || "")
 
-  if (
-    !/^[A-Za-z0-9_-]{43,128}$/.test(transactionToken) ||
-    !/^[A-Za-z0-9_-]{43,128}$/.test(codeVerifier)
-  ) {
+  if (!/^[A-Za-z0-9_-]{43,128}$/.test(transactionToken)) {
     return res.status(400).json({
-      error: "transaction and code_verifier are required"
+      error: "transaction is required"
     })
   }
 
-  const codeChallenge = crypto
-    .createHash("sha256")
-    .update(codeVerifier)
-    .digest("base64url")
   const client = await pool.connect()
 
   try {
@@ -1446,6 +1433,18 @@ app.post(["/auth/desktop/exchange", "/auth/google/exchange"], async (req, res) =
     }
 
     const transaction = transactionResult.rows[0]
+    const isGoogleTransaction = transaction.provider === "google"
+
+    if (
+      !isGoogleTransaction &&
+      !/^[A-Za-z0-9_-]{43,128}$/.test(codeVerifier)
+    ) {
+      await client.query("ROLLBACK")
+
+      return res.status(400).json({
+        error: "code_verifier is required for GitHub authorization"
+      })
+    }
 
     if (
       req.path === "/auth/google/exchange" &&
@@ -1461,7 +1460,10 @@ app.post(["/auth/desktop/exchange", "/auth/google/exchange"], async (req, res) =
     if (
       transaction.consumed_at ||
       new Date(transaction.expires_at).getTime() <= Date.now() ||
-      !valuesMatch(transaction.code_challenge, codeChallenge)
+      (!isGoogleTransaction && !valuesMatch(
+        transaction.code_challenge,
+        crypto.createHash("sha256").update(codeVerifier).digest("base64url")
+      ))
     ) {
       await client.query("ROLLBACK")
 
@@ -1495,7 +1497,7 @@ app.post(["/auth/desktop/exchange", "/auth/google/exchange"], async (req, res) =
         return
       }
 
-      const identity = await exchangeGoogleCode(config, code, codeVerifier)
+      const identity = await exchangeGoogleCode(config, code)
       user = await saveGoogleUser(identity)
     } else {
       const config = requireGitHubConfiguration(res)
