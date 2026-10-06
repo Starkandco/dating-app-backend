@@ -11,6 +11,9 @@ GITHUB_CLIENT_SECRET="your-github-client-secret"
 GITHUB_OAUTH_STATE_SECRET="a-long-random-secret"
 GITHUB_APP_SLUG="your-github-app-slug"
 GITHUB_CALLBACK_URL="https://miniature-acorn-97rx7qw5p5g2x7g-3000.app.github.dev/github/callback"
+GOOGLE_CLIENT_ID="your-google-oauth-client-id"
+GOOGLE_CLIENT_SECRET="your-google-oauth-client-secret"
+GOOGLE_CALLBACK_URL="https://your-backend.example.com/auth/google/callback"
 DATABASE_URL="postgresql://..."
 TOKEN_ENCRYPTION_KEY="base64-encoded-32-byte-key"
 ```
@@ -21,6 +24,13 @@ short-lived state cookie used to protect the callback. Start the OAuth flow at
 `/github/login`; it redirects to GitHub and exchanges the callback code for a
 user token.
 Use `/github/install` to redirect users to the GitHub App installation page.
+
+Configure a Google OAuth client with `GOOGLE_CALLBACK_URL` as an authorized
+redirect URI. Google sign-in starts at `/auth/google/init` with a PKCE
+`code_challenge`; desktop clients poll `/auth/desktop/status` and exchange
+the transaction at `/auth/google/exchange`. Google users receive backend
+sessions but need a GitHub account for repository operations. GitHub sign-in
+remains available independently at `/github/login`.
 
 Deploy this repository on Render as a Web Service with:
 
@@ -52,6 +62,8 @@ GET /github/installation-status
 GET /github/user
 POST /logout
 GET /auth/desktop/status?transaction=...
+GET /auth/google/init?code_challenge=...
+POST /auth/google/exchange
 ```
 
 `GET /github/installation-status` requires authentication and returns

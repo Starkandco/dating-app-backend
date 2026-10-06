@@ -109,6 +109,43 @@ function requireGitHubConfiguration(res) {
 }
 
 
+function requireGoogleConfiguration(res) {
+  const clientId = process.env.GOOGLE_CLIENT_ID
+  const clientSecret = process.env.GOOGLE_CLIENT_SECRET
+  const callbackUrl = process.env.GOOGLE_CALLBACK_URL
+  const missingConfiguration = [
+    ["GOOGLE_CLIENT_ID", clientId],
+    ["GOOGLE_CLIENT_SECRET", clientSecret],
+    ["GOOGLE_CALLBACK_URL", callbackUrl]
+  ]
+    .filter(([, value]) => !value)
+    .map(([name]) => name)
+
+  if (
+    isProduction &&
+    callbackUrl &&
+    !callbackUrl.startsWith("https://")
+  ) {
+    missingConfiguration.push("GOOGLE_CALLBACK_URL must use https in production")
+  }
+
+  if (missingConfiguration.length > 0) {
+    res.status(500).json({
+      error: "Missing Google OAuth configuration",
+      missing: missingConfiguration
+    })
+
+    return null
+  }
+
+  return {
+    clientId,
+    clientSecret,
+    callbackUrl
+  }
+}
+
+
 function getTokenEncryptionKey() {
   const key = Buffer.from(tokenEncryptionKey || "", "base64")
 
@@ -254,8 +291,8 @@ async function requireSession(req, res, next) {
     }
 
     const result = await pool.query(
-      `SELECT u.id, u.github_login, u.token_ciphertext, u.token_iv,
-              u.token_auth_tag
+          `SELECT u.id, u.github_login, u.google_id, u.email, u.name,
+              u.token_ciphertext, u.token_iv, u.token_auth_tag
          FROM sessions s
          JOIN users u ON u.id = s.user_id
         WHERE s.token_hash = $1 AND s.expires_at > NOW()`,
@@ -283,18 +320,44 @@ async function requireSession(req, res, next) {
 }
 
 
+function requireGitHubSession(req, res, next) {
+  if (!res.locals.user.token_ciphertext) {
+    return res.status(403).json({
+      error: "A GitHub account is required for this operation"
+    })
+  }
+
+  return next()
+}
+
+
 async function initializeDatabase() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
       id BIGSERIAL PRIMARY KEY,
-      github_user_id BIGINT UNIQUE NOT NULL,
-      github_login TEXT NOT NULL,
-      token_ciphertext TEXT NOT NULL,
-      token_iv TEXT NOT NULL,
-      token_auth_tag TEXT NOT NULL,
+      github_user_id BIGINT UNIQUE,
+      github_login TEXT,
+      google_id TEXT UNIQUE,
+      email TEXT,
+      name TEXT,
+      token_ciphertext TEXT,
+      token_iv TEXT,
+      token_auth_tag TEXT,
       token_created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
+  `)
+
+  await pool.query(`
+    ALTER TABLE users
+      ALTER COLUMN github_user_id DROP NOT NULL,
+      ALTER COLUMN github_login DROP NOT NULL,
+      ALTER COLUMN token_ciphertext DROP NOT NULL,
+      ALTER COLUMN token_iv DROP NOT NULL,
+      ALTER COLUMN token_auth_tag DROP NOT NULL,
+      ADD COLUMN IF NOT EXISTS google_id TEXT UNIQUE,
+      ADD COLUMN IF NOT EXISTS email TEXT,
+      ADD COLUMN IF NOT EXISTS name TEXT
   `)
 
   await pool.query(`
@@ -310,6 +373,7 @@ async function initializeDatabase() {
     CREATE TABLE IF NOT EXISTS oauth_transactions (
       transaction_hash TEXT PRIMARY KEY,
       state TEXT UNIQUE NOT NULL,
+      provider TEXT NOT NULL DEFAULT 'github',
       code_challenge TEXT NOT NULL,
       authorization_code_ciphertext TEXT,
       authorization_code_iv TEXT,
@@ -320,6 +384,10 @@ async function initializeDatabase() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `)
+
+  await pool.query(
+    "ALTER TABLE oauth_transactions ADD COLUMN IF NOT EXISTS provider TEXT NOT NULL DEFAULT 'github'"
+  )
 
   await pool.query(
     "CREATE INDEX IF NOT EXISTS sessions_expires_at_idx ON sessions(expires_at)"
@@ -438,6 +506,82 @@ async function saveGitHubUser(token) {
     id: savedUserResult.rows[0].id,
     login
   }
+}
+
+
+async function exchangeGoogleCode(config, code, codeVerifier) {
+  const tokenResponse = await fetch(
+    "https://oauth2.googleapis.com/token",
+    {
+      method: "POST",
+      signal: AbortSignal.timeout(10_000),
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded"
+      },
+      body: new URLSearchParams({
+        code,
+        client_id: config.clientId,
+        client_secret: config.clientSecret,
+        redirect_uri: config.callbackUrl,
+        grant_type: "authorization_code",
+        code_verifier: codeVerifier
+      })
+    }
+  )
+
+  const tokenData = await readJsonResponse(tokenResponse)
+
+  if (!tokenResponse.ok || !tokenData.id_token) {
+    const error = new Error(
+      tokenData.error_description || "Failed to exchange Google authorization code"
+    )
+    error.status = 400
+    throw error
+  }
+
+  const identityResponse = await fetch(
+    `https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(tokenData.id_token)}`,
+    { signal: AbortSignal.timeout(10_000) }
+  )
+  const identity = await readJsonResponse(identityResponse)
+
+  if (
+    !identityResponse.ok ||
+    identity.aud !== config.clientId ||
+    !["accounts.google.com", "https://accounts.google.com"].includes(identity.iss) ||
+    Number(identity.exp) * 1000 <= Date.now() ||
+    identity.email_verified !== "true" ||
+    !identity.sub ||
+    !identity.email
+  ) {
+    const error = new Error("Google identity token is invalid")
+    error.status = 401
+    throw error
+  }
+
+  return {
+    id: String(identity.sub),
+    email: String(identity.email),
+    name: typeof identity.name === "string" && identity.name
+      ? identity.name
+      : "User"
+  }
+}
+
+
+async function saveGoogleUser(identity) {
+  const result = await pool.query(
+    `INSERT INTO users (google_id, email, name)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (google_id) DO UPDATE SET
+       email = EXCLUDED.email,
+       name = EXCLUDED.name,
+       updated_at = NOW()
+     RETURNING id, google_id, email, name`,
+    [identity.id, identity.email, identity.name]
+  )
+
+  return result.rows[0]
 }
 
 
@@ -905,6 +1049,57 @@ app.get("/auth/github", async (req, res) => {
 })
 
 
+app.get("/auth/google/init", async (req, res) => {
+  const config = requireGoogleConfiguration(res)
+
+  if (!config) {
+    return
+  }
+
+  const codeChallenge = String(req.query.code_challenge || "")
+
+  if (!/^[A-Za-z0-9_-]{43}$/.test(codeChallenge)) {
+    return res.status(400).json({
+      error: "A valid PKCE code_challenge is required"
+    })
+  }
+
+  const transactionToken = crypto.randomBytes(32).toString("base64url")
+  const state = crypto.randomBytes(32).toString("hex")
+  const expiresAt = new Date(
+    Date.now() + oauthStateLifetimeSeconds * 1000
+  )
+
+  await pool.query(
+    `INSERT INTO oauth_transactions (
+       transaction_hash,
+       state,
+       provider,
+       code_challenge,
+       expires_at
+     ) VALUES ($1, $2, 'google', $3, $4)`,
+    [hashValue(transactionToken), state, codeChallenge, expiresAt]
+  )
+
+  const authorizeUrl = new URL(
+    "https://accounts.google.com/o/oauth2/v2/auth"
+  )
+  authorizeUrl.searchParams.set("client_id", config.clientId)
+  authorizeUrl.searchParams.set("redirect_uri", config.callbackUrl)
+  authorizeUrl.searchParams.set("response_type", "code")
+  authorizeUrl.searchParams.set("scope", "openid email profile")
+  authorizeUrl.searchParams.set("state", state)
+  authorizeUrl.searchParams.set("code_challenge", codeChallenge)
+  authorizeUrl.searchParams.set("code_challenge_method", "S256")
+
+  return res.json({
+    authorization_url: authorizeUrl.toString(),
+    transaction: transactionToken,
+    expires_at: expiresAt.toISOString()
+  })
+})
+
+
 app.get("/auth/desktop/status", async (req, res) => {
   const transactionToken = String(req.query.transaction || "")
 
@@ -915,7 +1110,7 @@ app.get("/auth/desktop/status", async (req, res) => {
   }
 
   const result = await pool.query(
-    `SELECT authorization_code_ciphertext, expires_at, consumed_at
+    `SELECT authorization_code_ciphertext, provider, expires_at, consumed_at
        FROM oauth_transactions
       WHERE transaction_hash = $1`,
     [hashValue(transactionToken)]
@@ -939,6 +1134,7 @@ app.get("/auth/desktop/status", async (req, res) => {
 
   return res.json({
     authorized: Boolean(transaction.authorization_code_ciphertext),
+    provider: transaction.provider,
     exchange_url: "/auth/desktop/exchange",
     expires_at: new Date(transaction.expires_at).toISOString()
   })
@@ -1035,7 +1231,7 @@ app.get("/github/callback", async (req, res) => {
     const transactionResult = await pool.query(
       `SELECT transaction_hash, code_challenge, expires_at, consumed_at
          FROM oauth_transactions
-        WHERE state = $1`,
+        WHERE state = $1 AND provider = 'github'`,
       [String(state)]
     )
 
@@ -1137,7 +1333,77 @@ app.get("/github/callback", async (req, res) => {
 })
 
 
-app.post("/auth/desktop/exchange", async (req, res) => {
+app.get("/auth/google/callback", async (req, res) => {
+  try {
+    const { code, state, error, error_description: errorDescription } = req.query
+
+    if (error) {
+      return res.status(400).json({
+        error,
+        error_description: errorDescription || null
+      })
+    }
+
+    if (!code || !state) {
+      return res.status(400).json({
+        error: "Authorization code and state are required"
+      })
+    }
+
+    const transactionResult = await pool.query(
+      `SELECT transaction_hash, expires_at, consumed_at
+         FROM oauth_transactions
+        WHERE state = $1 AND provider = 'google'`,
+      [String(state)]
+    )
+
+    if (transactionResult.rowCount === 0) {
+      return res.status(400).json({
+        error: "Invalid Google authorization state"
+      })
+    }
+
+    const transaction = transactionResult.rows[0]
+
+    if (
+      transaction.consumed_at ||
+      new Date(transaction.expires_at).getTime() <= Date.now()
+    ) {
+      return res.status(400).json({
+        error: "Google authorization transaction expired"
+      })
+    }
+
+    const encryptedCode = encryptToken(String(code))
+
+    await pool.query(
+      `UPDATE oauth_transactions
+          SET authorization_code_ciphertext = $1,
+              authorization_code_iv = $2,
+              authorization_code_auth_tag = $3
+        WHERE transaction_hash = $4`,
+      [
+        encryptedCode.ciphertext,
+        encryptedCode.iv,
+        encryptedCode.authTag,
+        transaction.transaction_hash
+      ]
+    )
+
+    return res.send(
+      "Google authorization complete. Return to the application to finish sign-in."
+    )
+  } catch (error) {
+    console.error("GOOGLE CALLBACK ERROR:", error.message)
+
+    return res.status(500).json({
+      error: "Google authorization failed"
+    })
+  }
+})
+
+
+app.post(["/auth/desktop/exchange", "/auth/google/exchange"], async (req, res) => {
   const transactionToken = String(req.body?.transaction || "")
   const codeVerifier = String(req.body?.code_verifier || "")
 
@@ -1160,7 +1426,7 @@ app.post("/auth/desktop/exchange", async (req, res) => {
     await client.query("BEGIN")
 
     const transactionResult = await client.query(
-      `SELECT transaction_hash, code_challenge,
+      `SELECT transaction_hash, provider, code_challenge,
               authorization_code_ciphertext,
               authorization_code_iv,
               authorization_code_auth_tag,
@@ -1180,6 +1446,17 @@ app.post("/auth/desktop/exchange", async (req, res) => {
     }
 
     const transaction = transactionResult.rows[0]
+
+    if (
+      req.path === "/auth/google/exchange" &&
+      transaction.provider !== "google"
+    ) {
+      await client.query("ROLLBACK")
+
+      return res.status(400).json({
+        error: "Transaction is not a Google authorization"
+      })
+    }
 
     if (
       transaction.consumed_at ||
@@ -1202,25 +1479,35 @@ app.post("/auth/desktop/exchange", async (req, res) => {
       })
     }
 
-    const config = requireGitHubConfiguration(res)
-
-    if (!config) {
-      await client.query("ROLLBACK")
-      return
-    }
-
     const encryptedCode = {
       token_ciphertext: transaction.authorization_code_ciphertext,
       token_iv: transaction.authorization_code_iv,
       token_auth_tag: transaction.authorization_code_auth_tag
     }
     const code = decryptToken(encryptedCode)
-    const token = await exchangeGitHubCode(
-      config,
-      code,
-      codeVerifier
-    )
-    const user = await saveGitHubUser(token)
+    let user
+
+    if (transaction.provider === "google") {
+      const config = requireGoogleConfiguration(res)
+
+      if (!config) {
+        await client.query("ROLLBACK")
+        return
+      }
+
+      const identity = await exchangeGoogleCode(config, code, codeVerifier)
+      user = await saveGoogleUser(identity)
+    } else {
+      const config = requireGitHubConfiguration(res)
+
+      if (!config) {
+        await client.query("ROLLBACK")
+        return
+      }
+
+      const token = await exchangeGitHubCode(config, code, codeVerifier)
+      user = await saveGitHubUser(token)
+    }
 
     await client.query(
       "DELETE FROM sessions WHERE user_id = $1 OR expires_at <= NOW()",
@@ -1240,9 +1527,10 @@ app.post("/auth/desktop/exchange", async (req, res) => {
     return res.json({
       session_token: session.token,
       expires_at: session.expiresAt.toISOString(),
-      user: {
-        login: user.login
-      }
+      provider: transaction.provider,
+      user: transaction.provider === "google"
+        ? { email: user.email, name: user.name }
+        : { login: user.login }
     })
   } catch (error) {
     await client.query("ROLLBACK").catch(() => {})
@@ -1260,12 +1548,15 @@ app.post("/auth/desktop/exchange", async (req, res) => {
 app.get("/auth-status", requireSession, (req, res) => {
   return res.json({
     authenticated: true,
-    login: res.locals.user.github_login
+    provider: res.locals.user.google_id ? "google" : "github",
+    login: res.locals.user.github_login,
+    email: res.locals.user.email,
+    name: res.locals.user.name
   })
 })
 
 
-app.get("/github/installation-status", requireSession, async (req, res) => {
+app.get("/github/installation-status", requireSession, requireGitHubSession, async (req, res) => {
   const appSlug = process.env.GITHUB_APP_SLUG
 
   if (!appSlug) {
@@ -1297,7 +1588,7 @@ app.get("/github/installation-status", requireSession, async (req, res) => {
 })
 
 
-app.get("/github/user", requireSession, async (req, res) => {
+app.get("/github/user", requireSession, requireGitHubSession, async (req, res) => {
   try {
     const token = decryptToken(res.locals.user)
     const userResult = await githubRequest(
@@ -1325,7 +1616,7 @@ app.get("/github/user", requireSession, async (req, res) => {
 })
 
 
-app.post("/github/repositories", requireSession, async (req, res) => {
+app.post("/github/repositories", requireSession, requireGitHubSession, async (req, res) => {
   try {
     const body = req.body || {}
     const name = body.name
@@ -1366,7 +1657,7 @@ app.post("/github/repositories", requireSession, async (req, res) => {
 })
 
 
-app.get("/github/repositories/:owner/:repo", requireSession, async (req, res) => {
+app.get("/github/repositories/:owner/:repo", requireSession, requireGitHubSession, async (req, res) => {
   const repository = repositoryParams(req)
 
   if (!repository) {
@@ -1392,7 +1683,7 @@ app.get("/github/repositories/:owner/:repo", requireSession, async (req, res) =>
 })
 
 
-app.delete("/github/repositories/:owner/:repo", requireSession, async (req, res) => {
+app.delete("/github/repositories/:owner/:repo", requireSession, requireGitHubSession, async (req, res) => {
   const repository = repositoryParams(req)
 
   if (!repository) {
@@ -1419,7 +1710,7 @@ app.delete("/github/repositories/:owner/:repo", requireSession, async (req, res)
 })
 
 
-app.post("/github/repositories/:owner/:repo/publish", requireSession, async (req, res) => {
+app.post("/github/repositories/:owner/:repo/publish", requireSession, requireGitHubSession, async (req, res) => {
   const repository = repositoryParams(req)
 
   if (!repository) {
@@ -1447,7 +1738,7 @@ app.post("/github/repositories/:owner/:repo/publish", requireSession, async (req
 })
 
 
-app.post("/github/publish", requireSession, async (req, res) => {
+app.post("/github/publish", requireSession, requireGitHubSession, async (req, res) => {
   const body = req.body || {}
   const repository = body.repository || {}
   const owner = body.owner || repository.owner
@@ -1483,7 +1774,7 @@ app.post("/github/publish", requireSession, async (req, res) => {
 })
 
 
-app.post("/github/repositories/:owner/:repo/pages", requireSession, async (req, res) => {
+app.post("/github/repositories/:owner/:repo/pages", requireSession, requireGitHubSession, async (req, res) => {
   const repository = repositoryParams(req)
 
   if (!repository) {
@@ -1513,7 +1804,7 @@ app.post("/github/repositories/:owner/:repo/pages", requireSession, async (req, 
 })
 
 
-app.post("/github/repositories/:owner/:repo/pages/build", requireSession, async (req, res) => {
+app.post("/github/repositories/:owner/:repo/pages/build", requireSession, requireGitHubSession, async (req, res) => {
   const repository = repositoryParams(req)
 
   if (!repository) {
@@ -1536,7 +1827,7 @@ app.post("/github/repositories/:owner/:repo/pages/build", requireSession, async 
 })
 
 
-app.get("/github/repositories/:owner/:repo/pages/build", requireSession, async (req, res) => {
+app.get("/github/repositories/:owner/:repo/pages/build", requireSession, requireGitHubSession, async (req, res) => {
   const repository = repositoryParams(req)
 
   if (!repository) {
