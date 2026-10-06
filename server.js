@@ -340,6 +340,7 @@ async function initializeDatabase() {
       google_id TEXT UNIQUE,
       email TEXT,
       name TEXT,
+      repository_name TEXT,
       token_ciphertext TEXT,
       token_iv TEXT,
       token_auth_tag TEXT,
@@ -357,8 +358,13 @@ async function initializeDatabase() {
       ALTER COLUMN token_auth_tag DROP NOT NULL,
       ADD COLUMN IF NOT EXISTS google_id TEXT UNIQUE,
       ADD COLUMN IF NOT EXISTS email TEXT,
-      ADD COLUMN IF NOT EXISTS name TEXT
+      ADD COLUMN IF NOT EXISTS name TEXT,
+      ADD COLUMN IF NOT EXISTS repository_name TEXT
   `)
+
+  await pool.query(
+    "CREATE UNIQUE INDEX IF NOT EXISTS users_repository_name_unique ON users(repository_name) WHERE repository_name IS NOT NULL"
+  )
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS sessions (
@@ -573,18 +579,103 @@ async function exchangeGoogleCode(config, code) {
 
 
 async function saveGoogleUser(identity) {
-  const result = await pool.query(
-    `INSERT INTO users (google_id, email, name)
-     VALUES ($1, $2, $3)
-     ON CONFLICT (google_id) DO UPDATE SET
-       email = EXCLUDED.email,
-       name = EXCLUDED.name,
-       updated_at = NOW()
-     RETURNING id, google_id, email, name`,
+  const existingUser = await pool.query(
+    `UPDATE users
+        SET email = $2, name = $3, updated_at = NOW()
+      WHERE google_id = $1
+      RETURNING id, google_id, email, name, repository_name, FALSE AS is_new_user`,
     [identity.id, identity.email, identity.name]
   )
 
-  return result.rows[0]
+  if (
+    existingUser.rowCount > 0 &&
+    existingUser.rows[0].repository_name
+  ) {
+    return existingUser.rows[0]
+  }
+
+  const emailPrefix = identity.email
+    .split("@")[0]
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 60)
+    .replace(/-+$/g, "") || "user"
+  const identitySuffix = crypto
+    .createHash("sha256")
+    .update(identity.id)
+    .digest("hex")
+    .slice(0, 10)
+
+  for (let attempt = 1; attempt <= 10; attempt += 1) {
+    const collisionSuffix = attempt === 1 ? "" : `-${attempt}`
+    const repositoryName = `${emailPrefix}-${identitySuffix}${collisionSuffix}`
+
+    try {
+      if (existingUser.rowCount > 0) {
+        const assignedName = await pool.query(
+          `UPDATE users
+              SET repository_name = $1
+            WHERE google_id = $2 AND repository_name IS NULL
+            RETURNING id, google_id, email, name, repository_name, FALSE AS is_new_user`,
+          [repositoryName, identity.id]
+        )
+
+        if (assignedName.rowCount > 0) {
+          return assignedName.rows[0]
+        }
+
+        const concurrentlyAssignedName = await pool.query(
+          `SELECT id, google_id, email, name, repository_name,
+                  FALSE AS is_new_user
+             FROM users
+            WHERE google_id = $1`,
+          [identity.id]
+        )
+
+        if (concurrentlyAssignedName.rowCount > 0) {
+          return concurrentlyAssignedName.rows[0]
+        }
+
+        continue
+      }
+
+      const insertedUser = await pool.query(
+        `INSERT INTO users (google_id, email, name, repository_name)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (google_id) DO NOTHING
+         RETURNING id, google_id, email, name, repository_name, TRUE AS is_new_user`,
+        [identity.id, identity.email, identity.name, repositoryName]
+      )
+
+      if (insertedUser.rowCount > 0) {
+        return insertedUser.rows[0]
+      }
+
+      const concurrentlyCreatedUser = await pool.query(
+        `UPDATE users
+            SET email = $2, name = $3, updated_at = NOW()
+          WHERE google_id = $1
+          RETURNING id, google_id, email, name, repository_name, FALSE AS is_new_user`,
+        [identity.id, identity.email, identity.name]
+      )
+
+      if (concurrentlyCreatedUser.rowCount > 0) {
+        return concurrentlyCreatedUser.rows[0]
+      }
+    } catch (error) {
+      if (
+        error.code !== "23505" ||
+        error.constraint !== "users_repository_name_unique"
+      ) {
+        throw error
+      }
+    }
+  }
+
+  throw new Error("Could not generate a unique repository name")
 }
 
 
@@ -1524,7 +1615,14 @@ app.post(["/auth/desktop/exchange", "/auth/google/exchange"], async (req, res) =
       provider: transaction.provider,
       user: transaction.provider === "google"
         ? { email: user.email, name: user.name }
-        : { login: user.login }
+        : { login: user.login },
+      ...(transaction.provider === "google"
+        ? {
+          repository_name: user.repository_name,
+          repository_owner: process.env.GITHUB_REPOSITORY_OWNER || null,
+          is_new_user: user.is_new_user
+        }
+        : {})
     })
   } catch (error) {
     await client.query("ROLLBACK").catch(() => {})

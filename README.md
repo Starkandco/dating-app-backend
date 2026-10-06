@@ -10,6 +10,7 @@ GITHUB_CLIENT_ID="your-github-app-client-id"
 GITHUB_CLIENT_SECRET="your-github-client-secret"
 GITHUB_OAUTH_STATE_SECRET="a-long-random-secret"
 GITHUB_APP_SLUG="your-github-app-slug"
+GITHUB_REPOSITORY_OWNER="your-github-account"
 GITHUB_CALLBACK_URL="https://miniature-acorn-97rx7qw5p5g2x7g-3000.app.github.dev/github/callback"
 GOOGLE_CLIENT_ID="your-google-oauth-client-id"
 GOOGLE_CLIENT_SECRET="your-google-oauth-client-secret"
@@ -30,9 +31,12 @@ redirect URI. Google sign-in starts at `/auth/google/init`; after browser
 authorization, poll `/auth/desktop/status` and exchange the transaction at
 `/auth/google/exchange`. Google uses the server-side client secret and does not
 require a client-supplied PKCE verifier. Google users receive backend sessions
-but need a GitHub account for repository operations. GitHub sign-in remains
-available independently at `/github/login` and continues to require PKCE for
-desktop clients.
+with a persistent unique `repository_name` derived from their email and Google
+identity. Set `GITHUB_REPOSITORY_OWNER` to the GitHub account that owns those
+repositories; the exchange response includes it and an `is_new_user` flag.
+Google users still need GitHub credentials for the existing repository
+operations. GitHub sign-in remains available independently at `/github/login`
+and continues to require PKCE for desktop clients.
 
 Deploy this repository on Render as a Web Service with:
 
