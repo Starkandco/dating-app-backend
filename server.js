@@ -720,23 +720,8 @@ async function exchangeGoogleCode(config, code) {
 }
 
 
-async function saveGoogleUser(identity) {
-  const existingUser = await pool.query(
-    `UPDATE users
-        SET email = $2, name = $3, updated_at = NOW()
-      WHERE google_id = $1
-      RETURNING id, google_id, email, name, repository_name, FALSE AS is_new_user`,
-    [identity.id, identity.email, identity.name]
-  )
-
-  if (
-    existingUser.rowCount > 0 &&
-    existingUser.rows[0].repository_name
-  ) {
-    return existingUser.rows[0]
-  }
-
-  const emailPrefix = identity.email
+function repositoryNameFromEmail(email) {
+  return email
     .split("@")[0]
     .normalize("NFKD")
     .replace(/[\u0300-\u036f]/g, "")
@@ -745,15 +730,105 @@ async function saveGoogleUser(identity) {
     .replace(/^-+|-+$/g, "")
     .slice(0, 60)
     .replace(/-+$/g, "") || "user"
+}
+
+
+async function renameLegacyGoogleRepository(user, identity, emailPrefix) {
   const identitySuffix = crypto
     .createHash("sha256")
     .update(identity.id)
     .digest("hex")
     .slice(0, 10)
+  const legacyPrefix = `${emailPrefix}-${identitySuffix}`
+  const isLegacyGeneratedName = user.repository_name === legacyPrefix ||
+    new RegExp(`^${legacyPrefix}-\\d+$`).test(user.repository_name)
+
+  const config = getGitHubAppConfiguration()
+  const token = await getGitHubAppInstallationToken(config)
+
+  if (!isLegacyGeneratedName) {
+    try {
+      await githubJsonRequest(
+        token,
+        repositoryUrl(config.repositoryOwner, user.repository_name),
+        "PATCH",
+        { private: true }
+      )
+    } catch (error) {
+      if (error.status !== 404) {
+        throw error
+      }
+    }
+
+    return user
+  }
 
   for (let attempt = 1; attempt <= 10; attempt += 1) {
     const collisionSuffix = attempt === 1 ? "" : `-${attempt}`
-    const repositoryName = `${emailPrefix}-${identitySuffix}${collisionSuffix}`
+    const repositoryName = `${emailPrefix}${collisionSuffix}`
+    const existingName = await pool.query(
+      `SELECT id FROM users
+        WHERE repository_name = $1 AND id <> $2`,
+      [repositoryName, user.id]
+    )
+
+    if (existingName.rowCount > 0) {
+      continue
+    }
+
+    try {
+      await githubJsonRequest(
+        token,
+        repositoryUrl(config.repositoryOwner, user.repository_name),
+        "PATCH",
+        { name: repositoryName, private: true }
+      )
+    } catch (error) {
+      if (error.status === 422) {
+        continue
+      }
+
+      if (error.status !== 404) {
+        throw error
+      }
+    }
+
+    const updatedUser = await pool.query(
+      `UPDATE users
+          SET repository_name = $1, updated_at = NOW()
+        WHERE id = $2
+        RETURNING id, google_id, email, name, repository_name, FALSE AS is_new_user`,
+      [repositoryName, user.id]
+    )
+
+    return updatedUser.rows[0]
+  }
+
+  throw new Error("Could not assign a shorter unique repository name")
+}
+
+
+async function saveGoogleUser(identity) {
+  const existingUser = await pool.query(
+    `UPDATE users
+        SET email = $2, name = $3, updated_at = NOW()
+      WHERE google_id = $1
+      RETURNING id, google_id, email, name, repository_name, FALSE AS is_new_user`,
+    [identity.id, identity.email, identity.name]
+  )
+  const emailPrefix = repositoryNameFromEmail(identity.email)
+
+  if (existingUser.rowCount > 0) {
+    const user = existingUser.rows[0]
+
+    if (user.repository_name) {
+      return renameLegacyGoogleRepository(user, identity, emailPrefix)
+    }
+  }
+
+  for (let attempt = 1; attempt <= 10; attempt += 1) {
+    const collisionSuffix = attempt === 1 ? "" : `-${attempt}`
+    const repositoryName = `${emailPrefix}${collisionSuffix}`
 
     try {
       if (existingUser.rowCount > 0) {
@@ -1056,6 +1131,15 @@ async function publishFiles(
         }
       }
     )
+
+    if (createIfMissing && !repository.data.private) {
+      repository = await githubJsonRequest(
+        token,
+        repositoryUrl(owner, repo),
+        "PATCH",
+        { private: true }
+      )
+    }
   } catch (error) {
     if (error.status !== 404 || !createIfMissing) {
       throw error
@@ -1067,7 +1151,7 @@ async function publishFiles(
       "POST",
       {
         name: repo,
-        private: false,
+        private: true,
         auto_init: true,
         description: "Published site"
       }
@@ -1891,7 +1975,7 @@ app.post("/github/repositories", requireSession, requireGitHubSession, authorize
         description: typeof body.description === "string"
           ? body.description.slice(0, 350)
           : undefined,
-        private: body.private === true,
+        private: true,
         auto_init: true
       }
     )
@@ -1983,7 +2067,7 @@ app.post("/github/repositories/:owner/:repo/publish", requireSession, requireGit
             res.locals.user.github_login.toLowerCase(),
         repositoryCreationUrl: res.locals.user.google_id
           ? `${githubApiUrl}/orgs/${encodeURIComponent(repository.owner)}/repos`
-          : null
+          : null,
       }
     )
 
@@ -2024,7 +2108,7 @@ app.post("/github/publish", requireSession, requireGitHubSession, authorizeGoogl
           owner.toLowerCase() === res.locals.user.github_login.toLowerCase(),
         repositoryCreationUrl: res.locals.user.google_id
           ? `${githubApiUrl}/orgs/${encodeURIComponent(owner)}/repos`
-          : null
+          : null,
       }
     )
 
