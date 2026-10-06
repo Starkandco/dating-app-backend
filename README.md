@@ -14,15 +14,17 @@ accounts created with the earlier hash-suffixed name are migrated on their next
 Google sign-in.
 
 GitHub sign-in continues to use the user's own GitHub OAuth token. Repositories
-created through the backend are private for both sign-in methods. When a
-GitHub-authenticated user publishes to an existing repository they own, the
-backend also makes that repository private. It does not change the visibility
-of repositories owned by someone else.
+created for Google users in the organization are public so GitHub Pages works
+on the organization's free plan. Repositories created for GitHub OAuth users
+are private; when they publish to an existing repository they own, the backend
+also makes that repository private. It does not change the visibility of
+repositories owned by someone else.
 
-The repository is the private source for the site; GitHub Pages serves the
-published website separately. The Pages configuration is left public. GitHub
-requires an eligible plan to publish Pages from a private repository, so check
-that the organization plan supports this combination.
+GitHub Pages serves the published website separately from its source
+repository. Pages settings remain public. GitHub requires an eligible plan to
+publish Pages from a private repository, so GitHub OAuth users may need an
+upgraded plan for Pages to work with their private repos. Google users' public
+source repositories can use Pages on the free plan.
 
 ## Google sign-in
 

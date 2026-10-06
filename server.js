@@ -752,7 +752,7 @@ async function renameLegacyGoogleRepository(user, identity, emailPrefix) {
         token,
         repositoryUrl(config.repositoryOwner, user.repository_name),
         "PATCH",
-        { private: true }
+        { private: false }
       )
     } catch (error) {
       if (error.status !== 404) {
@@ -781,7 +781,7 @@ async function renameLegacyGoogleRepository(user, identity, emailPrefix) {
         token,
         repositoryUrl(config.repositoryOwner, user.repository_name),
         "PATCH",
-        { name: repositoryName, private: true }
+        { name: repositoryName, private: false }
       )
     } catch (error) {
       if (error.status === 422) {
@@ -1110,7 +1110,11 @@ async function publishFiles(
   owner,
   repo,
   body,
-  { createIfMissing = false, repositoryCreationUrl = null } = {}
+  {
+    createIfMissing = false,
+    repositoryCreationUrl = null,
+    repositoryPrivate = false
+  } = {}
 ) {
   const filesResult = getPublishFiles(body)
 
@@ -1132,12 +1136,12 @@ async function publishFiles(
       }
     )
 
-    if (createIfMissing && !repository.data.private) {
+    if (createIfMissing && repository.data.private !== repositoryPrivate) {
       repository = await githubJsonRequest(
         token,
         repositoryUrl(owner, repo),
         "PATCH",
-        { private: true }
+        { private: repositoryPrivate }
       )
     }
   } catch (error) {
@@ -1151,7 +1155,7 @@ async function publishFiles(
       "POST",
       {
         name: repo,
-        private: true,
+        private: repositoryPrivate,
         auto_init: true,
         description: "Published site"
       }
@@ -1324,6 +1328,14 @@ app.get("/auth/github", async (req, res) => {
 
   if (!config) {
     return
+  }
+
+  const codeChallenge = String(req.query.code_challenge || "")
+
+  if (!/^[A-Za-z0-9_-]{43}$/.test(codeChallenge)) {
+    return res.status(400).json({
+      error: "A valid PKCE code_challenge is required"
+    })
   }
 
   const transactionToken = crypto.randomBytes(32).toString("base64url")
@@ -1975,7 +1987,7 @@ app.post("/github/repositories", requireSession, requireGitHubSession, authorize
         description: typeof body.description === "string"
           ? body.description.slice(0, 350)
           : undefined,
-        private: true,
+        private: !isGoogleUser,
         auto_init: true
       }
     )
@@ -2068,6 +2080,7 @@ app.post("/github/repositories/:owner/:repo/publish", requireSession, requireGit
         repositoryCreationUrl: res.locals.user.google_id
           ? `${githubApiUrl}/orgs/${encodeURIComponent(repository.owner)}/repos`
           : null,
+        repositoryPrivate: !res.locals.user.google_id
       }
     )
 
@@ -2109,6 +2122,7 @@ app.post("/github/publish", requireSession, requireGitHubSession, authorizeGoogl
         repositoryCreationUrl: res.locals.user.google_id
           ? `${githubApiUrl}/orgs/${encodeURIComponent(owner)}/repos`
           : null,
+        repositoryPrivate: !res.locals.user.google_id
       }
     )
 
