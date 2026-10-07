@@ -2058,6 +2058,13 @@ app.delete("/github/repositories/:owner/:repo", requireSession, requireGitHubSes
       }
     )
 
+    if (res.locals.user.google_id) {
+      await pool.query(
+        "UPDATE users SET repository_name = NULL WHERE id = $1",
+        [res.locals.user.id]
+      )
+    }
+
     return res.status(204).end()
   } catch (error) {
     return sendGitHubError(res, error)
