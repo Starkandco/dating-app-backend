@@ -1003,6 +1003,16 @@ function repositoryUrl(owner, repo, suffix = "") {
 }
 
 
+function sendAuthCompletionPage(res, message) {
+  return res.type("html").send(
+    `<!doctype html><html lang="en"><head>` +
+    `<meta name="viewport" content="width=device-width, initial-scale=1">` +
+    `<meta charset="utf-8"><title>Authorization complete</title>` +
+    `</head><body><h1>${message}</h1></body></html>`
+  )
+}
+
+
 function repositoryParams(req) {
   const { owner, repo } = req.params
 
@@ -1580,7 +1590,8 @@ app.get("/github/callback", async (req, res) => {
         ]
       )
 
-      return res.send(
+      return sendAuthCompletionPage(
+        res,
         "Authorization complete. Return to the application to finish sign-in."
       )
     }
@@ -1634,7 +1645,8 @@ app.get("/github/callback", async (req, res) => {
       }
     )
 
-    return res.send(
+    return sendAuthCompletionPage(
+      res,
       "GitHub authorization complete. You can return to the app."
     )
   } catch (error) {
@@ -1707,7 +1719,8 @@ app.get("/auth/google/callback", async (req, res) => {
       ]
     )
 
-    return res.send(
+    return sendAuthCompletionPage(
+      res,
       "Google authorization complete. Return to the application to finish sign-in."
     )
   } catch (error) {
