@@ -67,6 +67,7 @@ GITHUB_APP_ID=<numeric GitHub App ID>
 GITHUB_APP_INSTALLATION_ID=<organization installation ID>
 GITHUB_APP_PRIVATE_KEY_BASE64=<base64-encoded private key PEM>
 GITHUB_REPOSITORY_OWNER=I-m-dating-app
+OWNER_GITHUB_USER_IDS=<comma-separated GitHub account IDs allowed to administer users>
 GOOGLE_CLIENT_ID=<Google OAuth client ID>
 GOOGLE_CLIENT_SECRET=<Google OAuth client secret>
 GOOGLE_CALLBACK_URL=https://<backend-host>/auth/google/callback
@@ -92,6 +93,12 @@ The GitHub App installation token is minted by the backend and cached only
 until shortly before it expires. It is not stored in the database or returned
 to clients.
 
+For owner-only user moderation, sign in with each owner's GitHub account and
+call `GET /github/user`; set `OWNER_GITHUB_USER_IDS` to the returned numeric
+`id` value or comma-separated IDs, then redeploy. These stable GitHub account
+IDs—not usernames—authorize access to the moderation endpoints. If this setting
+is missing or invalid, owner moderation is unavailable.
+
 ## Deploying
 
 Deploy as a Render Web Service with `npm ci` as the build command and `npm start`
@@ -115,6 +122,20 @@ Public endpoints are `GET /healthz`, `GET /csae`, `GET /privacy`, `GET /auth/git
 `GET /auth/google/callback` for OAuth redirects. `GET /auth/desktop/status`
 checks a pending desktop sign-in; the matching exchange endpoint completes it.
 Authenticated clients can use `GET /auth-status` and `POST /logout`.
+
+Owners can use the following endpoints with their normal app session token:
+
+```text
+GET    /admin/users                         List users (up to 100 per page)
+PUT    /admin/users/{id}/block              Block a user and revoke their sessions
+DELETE /admin/users/{id}/block              Unblock a user
+```
+
+The list response includes `next_before_id` when another page is available;
+pass it as the `before_id` query parameter to fetch that page. A block prevents
+future sign-ins and immediately denies existing sessions. Unblocked users must
+sign in again. Blocking app access does not remove a profile already published
+to GitHub Pages; remove that content separately if needed.
 
 Repository operations are:
 

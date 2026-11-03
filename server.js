@@ -223,6 +223,11 @@ function hashValue(value) {
     .digest("hex")
 }
 
+function isValidDatabaseId(value) {
+  return /^[1-9]\d{0,19}$/.test(value) &&
+    BigInt(value) <= 9223372036854775807n
+}
+
 
 function valuesMatch(left, right) {
   const leftBuffer = Buffer.from(left)
@@ -305,12 +310,13 @@ async function requireSession(req, res, next) {
     }
 
     const result = await pool.query(
-          `SELECT u.id, u.github_login, u.google_id, u.email, u.name,
+      `SELECT u.id, u.github_user_id, u.github_login, u.google_id, u.email, u.name,
               u.repository_name,
               u.token_ciphertext, u.token_iv, u.token_auth_tag
          FROM sessions s
          JOIN users u ON u.id = s.user_id
-        WHERE s.token_hash = $1 AND s.expires_at > NOW()`,
+        WHERE s.token_hash = $1 AND s.expires_at > NOW()
+          AND u.is_blocked = FALSE`,
       [hashSessionToken(token)]
     )
 
@@ -456,6 +462,38 @@ async function requireGitHubSession(req, res, next) {
   }
 }
 
+function requireOwner(req, res, next) {
+  const configuredIds = process.env.OWNER_GITHUB_USER_IDS
+
+  if (!configuredIds) {
+    return res.status(503).json({
+      error: "Owner access is not configured"
+    })
+  }
+
+  const ownerIds = configuredIds.split(",").map((id) => id.trim())
+
+  if (ownerIds.some((id) => !/^[1-9]\d{0,19}$/.test(id))) {
+    console.error("OWNER_GITHUB_USER_IDS contains an invalid GitHub user ID")
+
+    return res.status(500).json({
+      error: "Owner access configuration is invalid"
+    })
+  }
+
+  if (
+    !res.locals.user.github_user_id ||
+    !ownerIds.includes(String(res.locals.user.github_user_id))
+  ) {
+    return res.status(403).json({
+      error: "Owner access required"
+    })
+  }
+
+  res.locals.ownerGithubUserIds = ownerIds
+  return next()
+}
+
 
 function authorizeGoogleRepository(req, res, next) {
   const user = res.locals.user
@@ -499,6 +537,9 @@ async function initializeDatabase() {
       token_iv TEXT,
       token_auth_tag TEXT,
       token_created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      is_blocked BOOLEAN NOT NULL DEFAULT FALSE,
+      block_reason TEXT,
+      blocked_at TIMESTAMPTZ,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `)
@@ -513,7 +554,10 @@ async function initializeDatabase() {
       ADD COLUMN IF NOT EXISTS google_id TEXT UNIQUE,
       ADD COLUMN IF NOT EXISTS email TEXT,
       ADD COLUMN IF NOT EXISTS name TEXT,
-      ADD COLUMN IF NOT EXISTS repository_name TEXT
+      ADD COLUMN IF NOT EXISTS repository_name TEXT,
+      ADD COLUMN IF NOT EXISTS is_blocked BOOLEAN NOT NULL DEFAULT FALSE,
+      ADD COLUMN IF NOT EXISTS block_reason TEXT,
+      ADD COLUMN IF NOT EXISTS blocked_at TIMESTAMPTZ
   `)
 
   await pool.query(
@@ -564,12 +608,39 @@ async function createSession(userId, res) {
   const expiresAt = new Date(
     Date.now() + sessionLifetimeSeconds * 1000
   )
+  let client
 
-  await pool.query(
-    `INSERT INTO sessions (token_hash, user_id, expires_at)
-     VALUES ($1, $2, $3)`,
-    [hashSessionToken(token), userId, expiresAt]
-  )
+  try {
+    client = await pool.connect()
+    await client.query("BEGIN")
+
+    const user = await client.query(
+      "SELECT is_blocked FROM users WHERE id = $1 FOR SHARE",
+      [userId]
+    )
+
+    if (user.rowCount === 0 || user.rows[0].is_blocked) {
+      const error = new Error("Account access is blocked")
+      error.status = 403
+      throw error
+    }
+
+    await client.query(
+      `INSERT INTO sessions (token_hash, user_id, expires_at)
+       VALUES ($1, $2, $3)`,
+      [hashSessionToken(token), userId, expiresAt]
+    )
+
+    await client.query("COMMIT")
+  } catch (error) {
+    if (client) {
+      await client.query("ROLLBACK").catch(() => {})
+    }
+
+    throw error
+  } finally {
+    client?.release()
+  }
 
   setSessionCookie(res, token)
 
@@ -656,6 +727,7 @@ async function saveGitHubUser(token) {
        token_auth_tag = EXCLUDED.token_auth_tag,
        token_created_at = NOW(),
        updated_at = NOW()
+       WHERE users.is_blocked = FALSE
      RETURNING id`,
     [
       githubUserId,
@@ -665,6 +737,12 @@ async function saveGitHubUser(token) {
       encryptedToken.authTag
     ]
   )
+
+  if (savedUserResult.rowCount === 0) {
+    const error = new Error("Account access is blocked")
+    error.status = 403
+    throw error
+  }
 
   return {
     id: savedUserResult.rows[0].id,
@@ -821,11 +899,27 @@ async function renameLegacyGoogleRepository(user, identity, emailPrefix) {
 }
 
 
+async function ensureGoogleAccountIsNotBlocked(googleId) {
+  const blockedUser = await pool.query(
+    "SELECT 1 FROM users WHERE google_id = $1 AND is_blocked = TRUE",
+    [googleId]
+  )
+
+  if (blockedUser.rowCount > 0) {
+    const error = new Error("Account access is blocked")
+    error.status = 403
+    throw error
+  }
+}
+
+
 async function saveGoogleUser(identity) {
+  await ensureGoogleAccountIsNotBlocked(identity.id)
+
   const existingUser = await pool.query(
     `UPDATE users
         SET email = $2, name = $3, updated_at = NOW()
-      WHERE google_id = $1
+      WHERE google_id = $1 AND is_blocked = FALSE
       RETURNING id, google_id, email, name, repository_name, FALSE AS is_new_user`,
     [identity.id, identity.email, identity.name]
   )
@@ -849,6 +943,7 @@ async function saveGoogleUser(identity) {
           `UPDATE users
               SET repository_name = $1
             WHERE google_id = $2 AND repository_name IS NULL
+              AND is_blocked = FALSE
             RETURNING id, google_id, email, name, repository_name, FALSE AS is_new_user`,
           [repositoryName, identity.id]
         )
@@ -861,7 +956,7 @@ async function saveGoogleUser(identity) {
           `SELECT id, google_id, email, name, repository_name,
                   FALSE AS is_new_user
              FROM users
-            WHERE google_id = $1`,
+            WHERE google_id = $1 AND is_blocked = FALSE`,
           [identity.id]
         )
 
@@ -869,6 +964,7 @@ async function saveGoogleUser(identity) {
           return concurrentlyAssignedName.rows[0]
         }
 
+        await ensureGoogleAccountIsNotBlocked(identity.id)
         continue
       }
 
@@ -887,7 +983,7 @@ async function saveGoogleUser(identity) {
       const concurrentlyCreatedUser = await pool.query(
         `UPDATE users
             SET email = $2, name = $3, updated_at = NOW()
-          WHERE google_id = $1
+        WHERE google_id = $1 AND is_blocked = FALSE
           RETURNING id, google_id, email, name, repository_name, FALSE AS is_new_user`,
         [identity.id, identity.email, identity.name]
       )
@@ -895,6 +991,8 @@ async function saveGoogleUser(identity) {
       if (concurrentlyCreatedUser.rowCount > 0) {
         return concurrentlyCreatedUser.rows[0]
       }
+
+      await ensureGoogleAccountIsNotBlocked(identity.id)
     } catch (error) {
       if (
         error.code !== "23505" ||
@@ -1666,8 +1764,10 @@ app.get("/github/callback", async (req, res) => {
       error
     )
 
-    return res.status(500).json({
-      error: "Internal server error"
+    return res.status(error.status === 403 ? 403 : 500).json({
+      error: error.status === 403
+        ? error.message
+        : "Internal server error"
     })
   }
 })
@@ -1912,6 +2012,189 @@ app.get("/auth-status", requireSession, (req, res) => {
     email: res.locals.user.email,
     name: res.locals.user.name
   })
+})
+
+app.get("/admin/users", requireSession, requireOwner, async (req, res) => {
+  const beforeId = req.query.before_id === undefined
+    ? null
+    : String(req.query.before_id)
+
+  if (beforeId !== null && !isValidDatabaseId(beforeId)) {
+    return res.status(400).json({
+      error: "before_id must be a positive user ID"
+    })
+  }
+
+  try {
+    const result = await pool.query(
+      `SELECT id::text AS id, github_user_id::text AS github_user_id,
+              github_login,
+              CASE WHEN google_id IS NOT NULL THEN 'google' ELSE 'github' END AS provider,
+              email, name, repository_name,
+              is_blocked, block_reason, blocked_at
+         FROM users
+        WHERE $1::bigint IS NULL OR id < $1::bigint
+        ORDER BY id DESC
+        LIMIT 101`,
+      [beforeId]
+    )
+    const hasMore = result.rows.length > 100
+    const users = result.rows.slice(0, 100)
+
+    return res.json({
+      users,
+      next_before_id: hasMore ? users[users.length - 1].id : null
+    })
+  } catch (error) {
+    console.error("ADMIN USER LIST FAILED:", error.message)
+
+    return res.status(500).json({
+      error: "Could not list users"
+    })
+  }
+})
+
+app.put("/admin/users/:id/block", requireSession, requireOwner, async (req, res) => {
+  const userId = req.params.id
+  const reason = req.body?.reason
+
+  if (!isValidDatabaseId(userId)) {
+    return res.status(400).json({
+      error: "Invalid user ID"
+    })
+  }
+
+  if (
+    reason !== undefined &&
+    (typeof reason !== "string" || reason.length > 500)
+  ) {
+    return res.status(400).json({
+      error: "reason must be a string of at most 500 characters"
+    })
+  }
+
+  let client
+
+  try {
+    client = await pool.connect()
+    await client.query("BEGIN")
+
+    const target = await client.query(
+      `SELECT id, github_user_id::text AS github_user_id
+         FROM users
+        WHERE id = $1
+        FOR UPDATE`,
+      [userId]
+    )
+
+    if (target.rowCount === 0) {
+      await client.query("ROLLBACK")
+
+      return res.status(404).json({
+        error: "User not found"
+      })
+    }
+
+    if (
+      target.rows[0].github_user_id &&
+      res.locals.ownerGithubUserIds.includes(target.rows[0].github_user_id)
+    ) {
+      await client.query("ROLLBACK")
+
+      return res.status(409).json({
+        error: "Owner accounts cannot be blocked"
+      })
+    }
+
+    const updatedUser = await client.query(
+      `UPDATE users
+          SET is_blocked = TRUE,
+              block_reason = $2,
+              blocked_at = NOW(),
+              updated_at = NOW()
+        WHERE id = $1
+        RETURNING id::text AS id, is_blocked, block_reason, blocked_at`,
+      [userId, typeof reason === "string" ? reason.trim() || null : null]
+    )
+
+    await client.query(
+      "DELETE FROM sessions WHERE user_id = $1",
+      [userId]
+    )
+    await client.query("COMMIT")
+
+    return res.json(updatedUser.rows[0])
+  } catch (error) {
+    if (client) {
+      await client.query("ROLLBACK").catch(() => {})
+    }
+
+    console.error("ADMIN USER BLOCK FAILED:", error.message)
+
+    return res.status(500).json({
+      error: "Could not block user"
+    })
+  } finally {
+    client?.release()
+  }
+})
+
+app.delete("/admin/users/:id/block", requireSession, requireOwner, async (req, res) => {
+  const userId = req.params.id
+
+  if (!isValidDatabaseId(userId)) {
+    return res.status(400).json({
+      error: "Invalid user ID"
+    })
+  }
+
+  let client
+
+  try {
+    client = await pool.connect()
+    await client.query("BEGIN")
+
+    const target = await client.query(
+      "SELECT id FROM users WHERE id = $1 FOR UPDATE",
+      [userId]
+    )
+
+    if (target.rowCount === 0) {
+      await client.query("ROLLBACK")
+
+      return res.status(404).json({
+        error: "User not found"
+      })
+    }
+
+    const result = await client.query(
+      `UPDATE users
+          SET is_blocked = FALSE,
+              block_reason = NULL,
+              blocked_at = NULL,
+              updated_at = NOW()
+        WHERE id = $1
+        RETURNING id::text AS id, is_blocked`,
+      [userId]
+    )
+
+    await client.query("DELETE FROM sessions WHERE user_id = $1", [userId])
+    await client.query("COMMIT")
+
+    return res.json(result.rows[0])
+  } catch (error) {
+    if (client) {
+      await client.query("ROLLBACK").catch(() => {})
+    }
+
+    console.error("ADMIN USER UNBLOCK FAILED:", error.message)
+
+    return res.status(500).json({
+      error: "Could not unblock user"
+    })
+  } finally {
+    client?.release()
+  }
 })
 
 
