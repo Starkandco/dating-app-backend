@@ -99,9 +99,18 @@ as the start command. Set the health check path to `/healthz`, create a Render
 PostgreSQL database, and set `DATABASE_URL` to its connection string. The
 service creates or migrates the required tables on startup.
 
+## Public policy pages
+
+The service provides two public static pages:
+
+- `GET /csae` serves the child sexual abuse and exploitation (CSAE) standards
+  page. Edit `public/csae.html` to publish the standards.
+- `GET /privacy` serves the privacy policy page. Edit `public/privacy.html` to
+  publish the policy.
+
 ## API overview
 
-Public endpoints are `GET /healthz`, `GET /auth/github`,
+Public endpoints are `GET /healthz`, `GET /csae`, `GET /privacy`, `GET /auth/github`,
 `GET /auth/google/init`, `GET /github/login`, and `GET /github/callback` /
 `GET /auth/google/callback` for OAuth redirects. `GET /auth/desktop/status`
 checks a pending desktop sign-in; the matching exchange endpoint completes it.

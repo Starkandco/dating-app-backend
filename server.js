@@ -3,6 +3,7 @@ import fetch from "node-fetch"
 import crypto from "node:crypto"
 import jwt from "jsonwebtoken"
 import pg from "pg"
+import { fileURLToPath } from "node:url"
 
 const { Pool } = pg
 
@@ -32,6 +33,8 @@ const pool = new Pool({
 
 const githubApiUrl = "https://api.github.com"
 const githubUserRepositoryName = "date-me"
+const csaePagePath = fileURLToPath(new URL("./public/csae.html", import.meta.url))
+const privacyPagePath = fileURLToPath(new URL("./public/privacy.html", import.meta.url))
 
 const githubHeaders = {
   Accept: "application/vnd.github+json",
@@ -71,6 +74,14 @@ app.use((req, res, next) => {
   })
 
   next()
+})
+
+app.get("/csae", (req, res) => {
+  return res.sendFile(csaePagePath)
+})
+
+app.get("/privacy", (req, res) => {
+  return res.sendFile(privacyPagePath)
 })
 
 
