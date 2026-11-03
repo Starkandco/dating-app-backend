@@ -2018,10 +2018,23 @@ app.get("/admin/users", requireSession, requireOwner, async (req, res) => {
   const beforeId = req.query.before_id === undefined
     ? null
     : String(req.query.before_id)
+  const provider = req.query.provider === undefined
+    ? null
+    : String(req.query.provider).trim()
+  const query = req.query.query === undefined
+    ? null
+    : String(req.query.query).trim()
 
   if (beforeId !== null && !isValidDatabaseId(beforeId)) {
     return res.status(400).json({
       error: "before_id must be a positive user ID"
+    })
+  }
+
+  if ((provider !== null || query !== null) &&
+      (!["github", "google"].includes(provider) || !query || query.length > 100)) {
+    return res.status(400).json({
+      error: "A valid provider and search query are required"
     })
   }
 
@@ -2033,10 +2046,19 @@ app.get("/admin/users", requireSession, requireOwner, async (req, res) => {
               email, name, repository_name,
               is_blocked, block_reason, blocked_at
          FROM users
-        WHERE $1::bigint IS NULL OR id < $1::bigint
+        WHERE ($1::bigint IS NULL OR id < $1::bigint)
+          AND (
+            $2::text IS NULL
+            OR ($2 = 'github'
+              AND github_user_id IS NOT NULL
+              AND github_login ILIKE '%' || $3 || '%')
+            OR ($2 = 'google'
+              AND google_id IS NOT NULL
+              AND (email ILIKE '%' || $3 || '%' OR name ILIKE '%' || $3 || '%'))
+          )
         ORDER BY id DESC
         LIMIT 101`,
-      [beforeId]
+      [beforeId, provider, query]
     )
     const hasMore = result.rows.length > 100
     const users = result.rows.slice(0, 100)

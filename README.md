@@ -137,6 +137,12 @@ future sign-ins and immediately denies existing sessions. Unblocked users must
 sign in again. Blocking app access does not remove a profile already published
 to GitHub Pages; remove that content separately if needed.
 
+To search users, pass both `provider` (`github` or `google`) and a non-empty
+`query` of at most 100 characters. GitHub searches match `github_login`;
+Google searches match `email` or `name`. Search terms can be combined with
+`before_id` for pagination. Requests with only one of `provider` or `query`
+are rejected.
+
 Repository operations are:
 
 ```text
