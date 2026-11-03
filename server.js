@@ -2031,10 +2031,15 @@ app.get("/admin/users", requireSession, requireOwner, async (req, res) => {
     })
   }
 
-  if ((provider !== null || query !== null) &&
-      (!["github", "google"].includes(provider) || !query || query.length > 100)) {
+  if (provider !== null && !["github", "google"].includes(provider)) {
     return res.status(400).json({
-      error: "A valid provider and search query are required"
+      error: "provider must be github or google"
+    })
+  }
+
+  if (query !== null && (!query || query.length > 100)) {
+    return res.status(400).json({
+      error: "query must be a non-empty string of at most 100 characters"
     })
   }
 
@@ -2049,12 +2054,21 @@ app.get("/admin/users", requireSession, requireOwner, async (req, res) => {
         WHERE ($1::bigint IS NULL OR id < $1::bigint)
           AND (
             $2::text IS NULL
-            OR ($2 = 'github'
+            OR ($2 = 'github' AND github_user_id IS NOT NULL)
+            OR ($2 = 'google' AND google_id IS NOT NULL)
+          )
+          AND (
+            $3::text IS NULL
+            OR (
+              ($2 IS NULL OR $2 = 'github')
               AND github_user_id IS NOT NULL
-              AND github_login ILIKE '%' || $3 || '%')
-            OR ($2 = 'google'
+              AND github_login ILIKE '%' || $3 || '%'
+            )
+            OR (
+              ($2 IS NULL OR $2 = 'google')
               AND google_id IS NOT NULL
-              AND (email ILIKE '%' || $3 || '%' OR name ILIKE '%' || $3 || '%'))
+              AND (email ILIKE '%' || $3 || '%' OR name ILIKE '%' || $3 || '%')
+            )
           )
         ORDER BY id DESC
         LIMIT 101`,
